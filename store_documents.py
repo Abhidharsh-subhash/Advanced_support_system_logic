@@ -454,7 +454,7 @@ Answer:"""
 # search("password reset process")
 # search("admin permissions")
 
-location = "/home/abhidharsh-fgil/FGIL Projects/FAISS/documents/Visa_Booking_Ticket_Dump_Realistic_200_Rows.xlsx"
+location = "/home/abhidharsh-fgil/FGIL Projects/FAISS/documents/AdminUserManual.docx"
 
 store_document_embeddings(location)
 
