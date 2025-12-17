@@ -1,4 +1,4 @@
-from langchain_community.document_loaders import Docx2txtLoader
+from langchain_community.document_loaders import Docx2txtLoader, PyPDFLoader
 import os
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
@@ -14,7 +14,7 @@ load_dotenv()
 # Set your OpenAI API key
 os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
 
-location = "/home/abhidharsh-fgil/FGIL Projects/FAISS/documents/AdminUserManual.docx"
+location = "/home/abhidharsh-fgil/FGIL Projects/FAISS/documents/tele_issues.xlsx"
 
 
 def process_docx(file_path: str, chunk_size: int, chunk_overlap: int) -> List[Document]:
@@ -194,6 +194,51 @@ def process_excel(
         return []
 
 
+def process_pdf(file_path: str, chunk_size: int, chunk_overlap: int) -> List[Document]:
+    """
+    Process PDF file and return chunks.
+
+    Args:
+        file_path: Path to PDF file
+        chunk_size: Size of text chunks
+        chunk_overlap: Overlap between chunks
+
+    Returns:
+        List of Document objects (chunks)
+    """
+    try:
+        # Load PDF - PyPDFLoader loads each page as a separate document
+        loader = PyPDFLoader(file_path)
+        documents = loader.load()
+        print(f"📄 Loaded PDF with {len(documents)} page(s)")
+
+        # Add/enhance metadata
+        filename = os.path.basename(file_path)
+        for doc in documents:
+            doc.metadata["filename"] = filename
+            doc.metadata["source"] = file_path
+            doc.metadata["file_type"] = "pdf"
+            doc.metadata["indexed_at"] = datetime.now().isoformat()
+            # PyPDFLoader already adds 'page' metadata, but ensure it exists
+            if "page" not in doc.metadata:
+                doc.metadata["page"] = 0
+
+        # Split documents into chunks
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            length_function=len,
+            separators=["\n\n", "\n", ". ", " ", ""],
+        )
+        chunks = text_splitter.split_documents(documents)
+        print(f"✂️ Split into {len(chunks)} chunks")
+
+        return chunks
+    except Exception as e:
+        print(f"❌ Error processing PDF: {str(e)}")
+        return []
+
+
 def store_document_embeddings(
     file_path: str,
     index_path: str = "faiss_index",
@@ -216,6 +261,7 @@ def store_document_embeddings(
         text_columns: Columns to include for CSV/Excel (None = all)
         sheet_name: Sheet(s) to process for Excel (None = all)
         row_format: 'structured' or 'natural' for CSV/Excel
+        pdf_loader_type: Loader type for PDF ('pypdf', 'pymupdf', 'pdfminer', 'unstructured')
 
     Returns:
         vector_store: The FAISS vector store object, or None if failed
@@ -249,6 +295,9 @@ def store_document_embeddings(
             text_columns=text_columns,
             row_format=row_format,
         )
+
+    elif file_extension == ".pdf":
+        chunks = process_pdf(file_path, chunk_size, chunk_overlap)
 
     else:
         print(f"❌ Unsupported file format: {file_extension}")
@@ -454,7 +503,7 @@ Answer:"""
 # search("password reset process")
 # search("admin permissions")
 
-location = "/home/abhidharsh-fgil/FGIL Projects/FAISS/documents/AdminUserManual.docx"
+# location = "/home/abhidharsh-fgil/FGIL Projects/FAISS/documents/67ee1cb7-d927-4ee6-9cbd-3f82e1ea0c0aFG_English_Telecom Technician  - IOT DevicesSystem_TELQ6210_4.0"
 
 store_document_embeddings(location)
 
