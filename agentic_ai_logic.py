@@ -3,7 +3,7 @@ import re
 import json
 import operator
 from datetime import datetime
-from typing import TypedDict, Annotated, Sequence, List, Literal
+from typing import TypedDict, Annotated, Sequence, List, Literal, Optional
 from enum import Enum
 
 from dotenv import load_dotenv
@@ -49,6 +49,14 @@ class Config:
     # Minimum number of relevant results needed
     MIN_RELEVANT_RESULTS = 1
 
+    # Scenario detection settings
+    MAX_DISAMBIGUATION_DEPTH = 3
+    MIN_SCENARIOS_FOR_DISAMBIGUATION = 2
+    MAX_SCENARIOS_TO_SHOW = 5
+
+    # Minimum confidence to trigger scenario disambiguation
+    SCENARIO_CONFIDENCE_THRESHOLD = 0.8
+
 
 # ========================================
 # ENUMS
@@ -69,16 +77,26 @@ class InteractionMode(str, Enum):
     CLARIFICATION = "clarification"
     NOT_FOUND = "not_found"
     CLOSING = "closing"
+    DISAMBIGUATION = "disambiguation"
+
+
+class ScenarioStatus(str, Enum):
+    SINGLE = "single"
+    MULTIPLE = "multiple"
+    NONE = "none"
+    RESOLVED = "resolved"
 
 
 # ========================================
 # VECTOR STORE
 # ========================================
 
+FAISS_INDEX_PATH = "/home/abhidharsh-fgil/FGIL Projects/Convergent/vector_store/faiss"
 
-def load_vector_store(index_path: str = "faiss_index"):
+
+def load_vector_store(index_path: str = FAISS_INDEX_PATH):
     if not os.path.exists(index_path):
-        return None
+        raise FileNotFoundError(f"FAISS index not found at {index_path}")
     embeddings = OpenAIEmbeddings(model="text-embedding-ada-002")
     return FAISS.load_local(
         index_path, embeddings, allow_dangerous_deserialization=True
@@ -115,7 +133,7 @@ class AgentState(TypedDict):
     conversation_history: List[dict]
     topic_history: List[str]
 
-    # Search state - CRITICAL FOR VALIDATION
+    # Search state
     search_confidence: float
     search_quality: str
     has_searched: bool
@@ -126,6 +144,18 @@ class AgentState(TypedDict):
     # Response control
     should_respond_not_found: bool
     not_found_message: str
+
+    # Scenario/disambiguation state
+    has_multiple_scenarios: bool
+    detected_scenarios: List[dict]
+    scenario_status: str
+    disambiguation_question: str
+    selected_scenario: Optional[str]
+    disambiguation_depth: int
+    scenario_context: List[dict]
+    awaiting_scenario_selection: bool
+    filtered_search_results: str
+    current_scenario_options: List[str]
 
 
 # ========================================
@@ -138,17 +168,7 @@ class SearchResultAnalyzer:
 
     @classmethod
     def analyze(cls, results: list, query: str) -> dict:
-        """
-        Analyze search results and determine quality.
-
-        Returns dict with:
-        - found_relevant_info: bool
-        - confidence: float (0-1)
-        - quality: SearchQuality
-        - best_score: float
-        - should_respond: bool
-        - reason: str
-        """
+        """Analyze search results and determine quality."""
         if not results:
             return {
                 "found_relevant_info": False,
@@ -160,16 +180,13 @@ class SearchResultAnalyzer:
                 "relevant_count": 0,
             }
 
-        # Extract scores (lower is better for FAISS L2)
         scores = [float(score) for _, score in results]
         best_score = min(scores)
         avg_score = sum(scores) / len(scores)
 
-        # Count relevant results (score below acceptable threshold)
         relevant_results = [s for s in scores if s < Config.ACCEPTABLE_SCORE]
         relevant_count = len(relevant_results)
 
-        # Determine quality and confidence
         if best_score < Config.EXCELLENT_SCORE:
             quality = SearchQuality.EXCELLENT.value
             confidence = 0.95
@@ -186,7 +203,6 @@ class SearchResultAnalyzer:
             quality = SearchQuality.NOT_FOUND.value
             confidence = 0.0
 
-        # Check keyword overlap for additional validation
         query_keywords = set(query.lower().split())
         keyword_matches = 0
 
@@ -199,7 +215,6 @@ class SearchResultAnalyzer:
 
         keyword_relevance = keyword_matches / max(len(query_keywords), 1)
 
-        # Final determination: should we respond with this info?
         should_respond = (
             quality != SearchQuality.NOT_FOUND.value
             and relevant_count >= Config.MIN_RELEVANT_RESULTS
@@ -208,7 +223,6 @@ class SearchResultAnalyzer:
             )
         )
 
-        # Reason for the decision
         if not should_respond:
             if quality == SearchQuality.NOT_FOUND.value:
                 reason = "No relevant information found in knowledge base"
@@ -231,40 +245,6 @@ class SearchResultAnalyzer:
             "keyword_relevance": keyword_relevance,
         }
 
-    @classmethod
-    def validate_response_content(cls, response: str, search_results: list) -> bool:
-        """
-        Validate that the response is actually based on search results.
-        Returns True if response seems to be from documents.
-        """
-        if not search_results:
-            return False
-
-        # Extract key phrases from search results
-        result_content = " ".join(doc.page_content.lower() for doc, _ in search_results)
-        response_lower = response.lower()
-
-        # Check if response contains key terms from results
-        result_words = set(result_content.split())
-        response_words = set(response_lower.split())
-
-        # Filter to meaningful words (length > 4)
-        meaningful_result_words = {w for w in result_words if len(w) > 4}
-        meaningful_response_words = {w for w in response_words if len(w) > 4}
-
-        if not meaningful_result_words:
-            return False
-
-        overlap = meaningful_response_words.intersection(meaningful_result_words)
-        overlap_ratio = (
-            len(overlap) / len(meaningful_response_words)
-            if meaningful_response_words
-            else 0
-        )
-
-        # At least 20% of response words should be from documents
-        return overlap_ratio > 0.2
-
 
 # ========================================
 # NOT FOUND RESPONSE GENERATOR
@@ -276,17 +256,15 @@ class NotFoundResponseGenerator:
 
     RESPONSES = {
         "general": [
-            "I don't have information about that in my knowledge base. Could you try asking about a different topic, or rephrase your question?",
+            "I don't have information about that in my knowledge base. Could you try asking about a different topic?",
             "I couldn't find any relevant information about this topic. Is there something else I can help you with?",
-            "That topic doesn't appear to be covered in the documentation I have access to. Would you like to ask about something else?",
+            "Sorry, I don't have data about that. Would you like to ask about something else?",
         ],
         "partial": [
-            "I found some related information, but nothing that directly answers your question. Would you like me to share what I found, or would you prefer to ask about something else?",
-            "I have some information that might be tangentially related, but I'm not confident it answers your question. Shall I share it, or would you like to try a different question?",
+            "I found some related information, but nothing that directly answers your question. Would you like me to share what I found?",
         ],
         "suggest_rephrase": [
-            "I couldn't find a match for your query. Could you try rephrasing it or being more specific about what you're looking for?",
-            "No results found for that query. Perhaps try using different keywords or asking in a different way?",
+            "I couldn't find a match for your query. Could you try rephrasing or being more specific?",
         ],
     }
 
@@ -294,13 +272,11 @@ class NotFoundResponseGenerator:
     def generate(
         cls, query: str, search_analysis: dict, available_topics: List[str] = None
     ) -> str:
-        """Generate an appropriate not-found response."""
         import random
 
         quality = search_analysis.get("quality", SearchQuality.NOT_FOUND.value)
         confidence = search_analysis.get("confidence", 0)
 
-        # Choose response type based on situation
         if quality == SearchQuality.LOW.value and confidence > 0.1:
             response = random.choice(cls.RESPONSES["partial"])
         elif confidence == 0:
@@ -308,7 +284,6 @@ class NotFoundResponseGenerator:
         else:
             response = random.choice(cls.RESPONSES["suggest_rephrase"])
 
-        # Add topic suggestions if available
         if available_topics and len(available_topics) > 0:
             topic_list = ", ".join(available_topics[:5])
             response += f"\n\nI can help you with topics like: {topic_list}."
@@ -317,58 +292,12 @@ class NotFoundResponseGenerator:
 
 
 # ========================================
-# QUERY ANALYZER
+# QUERY ANALYZER (SIMPLIFIED)
 # ========================================
 
 
 class QueryAnalyzer:
-    """Analyzes user queries for clarity."""
-
-    TRULY_VAGUE_PATTERNS = [
-        r"^(it|this|that|these|those)[\?\.]?$",
-        r"^(what|how|why|where|when)[\?\.]?$",
-        r"^(help|more|info|details)[\?\.]?$",
-        r"^tell me[\?\.]?$",
-        r"^explain[\?\.]?$",
-        r"^show me[\?\.]?$",
-    ]
-
-    @classmethod
-    def analyze(cls, query: str, context: dict = None) -> dict:
-        query_lower = query.lower().strip()
-
-        analysis = {
-            "is_clear": True,
-            "issues": [],
-            "clarification_type": None,
-            "follow_up_questions": [],
-            "confidence": 0.8,
-        }
-
-        if len(query_lower) < 2:
-            analysis["is_clear"] = False
-            analysis["issues"].append("empty_query")
-            analysis["clarification_type"] = "incomplete"
-            analysis["follow_up_questions"].append(
-                "I'm here to help! What would you like to know about?"
-            )
-            analysis["confidence"] = 0.0
-            return analysis
-
-        for pattern in cls.TRULY_VAGUE_PATTERNS:
-            if re.match(pattern, query_lower):
-                has_context = context and context.get("last_topic")
-                if not has_context:
-                    analysis["is_clear"] = False
-                    analysis["issues"].append("vague_reference")
-                    analysis["clarification_type"] = "vague"
-                    analysis["follow_up_questions"].append(
-                        "Could you please be more specific about what you'd like to know?"
-                    )
-                    analysis["confidence"] = 0.2
-                    return analysis
-
-        return analysis
+    """Analyzes user queries - simplified to avoid premature clarification."""
 
     @classmethod
     def is_greeting(cls, query: str) -> bool:
@@ -403,17 +332,158 @@ class QueryAnalyzer:
         query_clean = query.lower().strip().rstrip("!.,")
         return any(c in query_clean for c in closings)
 
+    @classmethod
+    def is_too_short(cls, query: str) -> bool:
+        """Check if query is too short to be meaningful."""
+        return len(query.strip()) < 3
+
+    @classmethod
+    def is_scenario_selection(
+        cls, query: str, available_options: List[str]
+    ) -> Optional[str]:
+        """Check if user's response is selecting a scenario from available options."""
+        if not available_options:
+            return None
+
+        query_lower = query.lower().strip()
+
+        # Check for numeric selection (1, 2, 3, etc.)
+        if query_lower.isdigit():
+            idx = int(query_lower) - 1
+            if 0 <= idx < len(available_options):
+                return available_options[idx]
+
+        # Check for letter selection (a, b, c, etc.)
+        if len(query_lower) == 1 and query_lower.isalpha():
+            idx = ord(query_lower) - ord("a")
+            if 0 <= idx < len(available_options):
+                return available_options[idx]
+
+        # Check for keyword match with options
+        for option in available_options:
+            option_lower = option.lower()
+            if option_lower in query_lower or query_lower in option_lower:
+                return option
+
+            # Check for significant word overlap
+            option_words = set(option_lower.split())
+            query_words = set(query_lower.split())
+            overlap = option_words.intersection(query_words)
+            if len(overlap) >= min(2, len(option_words) // 2 + 1):
+                return option
+
+        return None
+
 
 # ========================================
-# TOOLS WITH STRICT VALIDATION
+# SCENARIO DETECTOR (STRICT - CONTENT-BASED ONLY)
+# ========================================
+
+
+class ScenarioDetector:
+    """
+    Detects multiple scenarios ONLY from actual content in search results.
+    Does NOT speculate about scenarios that might exist.
+    """
+
+    DETECTION_PROMPT = """Analyze the following search results and determine if they contain MULTIPLE DISTINCT scenarios that the user needs to choose between.
+
+IMPORTANT RULES:
+1. ONLY identify scenarios that are EXPLICITLY mentioned in the search results
+2. DO NOT guess or infer scenarios that are not in the content
+3. If the content describes ONE process/procedure, there is NO disambiguation needed
+4. Multiple scenarios exist ONLY if the content explicitly mentions different cases like:
+   - "For users with X, do this... For users with Y, do that..."
+   - "Option A: ... Option B: ..."
+   - "If you are an admin... If you are a regular user..."
+
+USER QUERY: {query}
+
+SEARCH RESULTS CONTENT:
+{search_results}
+
+RESPOND IN JSON FORMAT:
+{{
+    "has_multiple_scenarios": true/false,
+    "scenarios": [
+        {{
+            "id": "scenario_1",
+            "title": "<brief title from content>",
+            "description": "<description from content>",
+            "exact_quote": "<quote from content that describes this scenario>"
+        }}
+    ],
+    "disambiguation_needed": true/false,
+    "suggested_question": "<question ONLY if disambiguation_needed is true>",
+    "reason": "<explanation>"
+}}
+
+CRITICAL: Set has_multiple_scenarios to FALSE unless the content EXPLICITLY contains multiple distinct procedures/options that require the user to choose.
+"""
+
+    @classmethod
+    def detect(cls, query: str, search_results: List[dict], llm: ChatOpenAI) -> dict:
+        """Detect if search results contain multiple scenarios."""
+        formatted_results = "\n\n---\n\n".join(
+            [doc.get("content", "") for doc in search_results[:5]]
+        )
+
+        prompt = cls.DETECTION_PROMPT.format(
+            query=query, search_results=formatted_results
+        )
+
+        try:
+            response = llm.invoke(
+                [
+                    SystemMessage(
+                        content="You are a strict scenario detector. Only identify scenarios EXPLICITLY present in the content. Never speculate."
+                    ),
+                    HumanMessage(content=prompt),
+                ]
+            )
+
+            content = response.content
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0]
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0]
+
+            result = json.loads(content.strip())
+
+            # Additional validation - require exact quotes for scenarios
+            scenarios = result.get("scenarios", [])
+            valid_scenarios = [s for s in scenarios if s.get("exact_quote")]
+
+            if len(valid_scenarios) < Config.MIN_SCENARIOS_FOR_DISAMBIGUATION:
+                result["has_multiple_scenarios"] = False
+                result["disambiguation_needed"] = False
+
+            result["scenarios"] = valid_scenarios
+            return result
+
+        except (json.JSONDecodeError, Exception) as e:
+            return {
+                "has_multiple_scenarios": False,
+                "scenarios": [],
+                "disambiguation_needed": False,
+                "suggested_question": "",
+                "reason": f"Error: {str(e)}",
+            }
+
+
+# ========================================
+# TOOLS
 # ========================================
 
 
 @tool
-def search_documents(query: str, num_results: int = 5) -> str:
+def search_and_analyze(query: str) -> str:
     """
-    Search the document database for relevant information.
-    Returns search results with quality analysis.
+    Search the document database and analyze if multiple scenarios exist.
+    This is the primary tool - always call this first.
+
+    Returns:
+        JSON with search results and scenario analysis
     """
     if VECTOR_STORE is None:
         return json.dumps(
@@ -422,22 +492,20 @@ def search_documents(query: str, num_results: int = 5) -> str:
                 "quality": SearchQuality.NOT_FOUND.value,
                 "confidence": 0.0,
                 "documents": [],
+                "has_multiple_scenarios": False,
+                "disambiguation_needed": False,
                 "message": "No knowledge base available",
-                "should_respond": False,
             }
         )
 
     try:
-        results = VECTOR_STORE.similarity_search_with_score(query, k=num_results)
+        results = VECTOR_STORE.similarity_search_with_score(query, k=5)
     except Exception as e:
         return json.dumps(
             {
                 "found_answer": False,
                 "error": str(e),
-                "quality": SearchQuality.NOT_FOUND.value,
-                "confidence": 0.0,
-                "documents": [],
-                "should_respond": False,
+                "has_multiple_scenarios": False,
             }
         )
 
@@ -448,38 +516,148 @@ def search_documents(query: str, num_results: int = 5) -> str:
                 "quality": SearchQuality.NOT_FOUND.value,
                 "confidence": 0.0,
                 "documents": [],
-                "message": "No results found for this query",
-                "should_respond": False,
+                "has_multiple_scenarios": False,
+                "disambiguation_needed": False,
+                "message": "No information found for this query in the knowledge base.",
             }
         )
 
-    # Analyze results quality
+    # Analyze search quality
     analysis = SearchResultAnalyzer.analyze(results, query)
 
-    # Only include documents if we should respond
+    if not analysis["should_respond"]:
+        return json.dumps(
+            {
+                "found_answer": False,
+                "quality": analysis["quality"],
+                "confidence": float(analysis["confidence"]),
+                "documents": [],
+                "has_multiple_scenarios": False,
+                "disambiguation_needed": False,
+                "message": "No relevant information found for this query.",
+                "reason": analysis["reason"],
+            }
+        )
+
+    # Prepare documents
     documents = []
-    if analysis["should_respond"]:
-        for doc, score in results:
-            if float(score) < Config.ACCEPTABLE_SCORE:
-                documents.append(
-                    {
-                        "content": doc.page_content,
-                        "relevance": (
-                            "high" if float(score) < Config.GOOD_SCORE else "medium"
-                        ),
-                    }
-                )
+    for doc, score in results:
+        if float(score) < Config.ACCEPTABLE_SCORE:
+            documents.append(
+                {
+                    "content": doc.page_content,
+                    "relevance": (
+                        "high" if float(score) < Config.GOOD_SCORE else "medium"
+                    ),
+                    "score": float(score),
+                }
+            )
+
+    if not documents:
+        return json.dumps(
+            {
+                "found_answer": False,
+                "quality": SearchQuality.NOT_FOUND.value,
+                "has_multiple_scenarios": False,
+                "disambiguation_needed": False,
+                "message": "No relevant information found.",
+            }
+        )
+
+    # Now check for multiple scenarios in the ACTUAL content
+    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    scenario_result = ScenarioDetector.detect(query, documents, llm)
+
+    has_multiple = scenario_result.get("has_multiple_scenarios", False)
+    disambiguation_needed = scenario_result.get("disambiguation_needed", False)
 
     return json.dumps(
         {
-            "found_answer": analysis["found_relevant_info"],
-            "should_respond": analysis["should_respond"],
+            "found_answer": True,
+            "should_respond": True,
             "quality": analysis["quality"],
             "confidence": float(analysis["confidence"]),
-            "best_score": float(analysis["best_score"]),
             "documents": documents,
             "count": len(documents),
-            "reason": analysis["reason"],
+            # Scenario info
+            "has_multiple_scenarios": has_multiple,
+            "disambiguation_needed": disambiguation_needed,
+            "scenarios": scenario_result.get("scenarios", []),
+            "disambiguation_question": (
+                scenario_result.get("suggested_question", "")
+                if disambiguation_needed
+                else ""
+            ),
+        }
+    )
+
+
+@tool
+def get_scenario_answer(
+    search_results_json: str, selected_scenario: str, original_query: str
+) -> str:
+    """
+    Get answer for a specific scenario after user selection.
+    Call this after user selects a scenario from disambiguation.
+
+    Args:
+        search_results_json: Previous search results
+        selected_scenario: User's selected scenario
+        original_query: Original question
+    """
+    if VECTOR_STORE is None:
+        return json.dumps(
+            {"found_answer": False, "message": "No knowledge base available"}
+        )
+
+    try:
+        original_data = json.loads(search_results_json)
+    except json.JSONDecodeError:
+        original_data = {"documents": []}
+
+    # Enhanced search with scenario context
+    enhanced_query = f"{original_query} {selected_scenario}"
+
+    try:
+        results = VECTOR_STORE.similarity_search_with_score(enhanced_query, k=5)
+    except Exception as e:
+        return json.dumps({"found_answer": False, "error": str(e)})
+
+    if not results:
+        return json.dumps(
+            {
+                "found_answer": False,
+                "message": f"No specific information found for '{selected_scenario}'.",
+            }
+        )
+
+    # Filter for scenario relevance
+    scenario_keywords = set(selected_scenario.lower().split())
+    filtered_docs = []
+
+    for doc, score in results:
+        content_lower = doc.page_content.lower()
+        keyword_matches = sum(
+            1 for kw in scenario_keywords if kw in content_lower and len(kw) > 3
+        )
+
+        if keyword_matches > 0 or float(score) < Config.GOOD_SCORE:
+            filtered_docs.append(
+                {
+                    "content": doc.page_content,
+                    "relevance": "high" if keyword_matches >= 2 else "medium",
+                    "score": float(score),
+                }
+            )
+
+    filtered_docs.sort(key=lambda x: x["score"])
+
+    return json.dumps(
+        {
+            "found_answer": len(filtered_docs) > 0,
+            "selected_scenario": selected_scenario,
+            "documents": filtered_docs[:3],
+            "should_respond": len(filtered_docs) > 0,
         }
     )
 
@@ -491,26 +669,17 @@ def get_available_topics() -> str:
         return json.dumps({"topics": [], "message": "No knowledge base available"})
 
     try:
-        # Sample documents to extract topics
         docs = VECTOR_STORE.similarity_search("", k=100)
-
-        # Extract potential topics from content
         all_text = " ".join(doc.page_content.lower() for doc in docs)
 
         topic_keywords = {
-            "User Management": ["user", "account", "profile", "permission", "role"],
-            "Authentication": ["login", "password", "sso", "authentication", "sign in"],
-            "Settings & Configuration": [
-                "settings",
-                "configure",
-                "setup",
-                "preferences",
-            ],
-            "Billing & Payments": ["invoice", "payment", "billing", "subscription"],
-            "Bookings & Reservations": ["booking", "reservation", "travel", "trip"],
-            "Reports & Analytics": ["report", "analytics", "dashboard", "export"],
+            "User Management": ["user", "account", "profile", "permission"],
+            "Authentication": ["login", "password", "sso", "authentication"],
+            "Settings": ["settings", "configure", "setup", "preferences"],
+            "Billing": ["invoice", "payment", "billing", "subscription"],
+            "Bookings": ["booking", "reservation", "travel", "trip"],
+            "Reports": ["report", "analytics", "dashboard", "export"],
             "Integration": ["api", "integration", "sync", "webhook"],
-            "Troubleshooting": ["error", "issue", "problem", "fix", "troubleshoot"],
         }
 
         available_topics = []
@@ -527,56 +696,66 @@ def get_available_topics() -> str:
 # SETUP
 # ========================================
 
-tools = [search_documents, get_available_topics]
+tools = [search_and_analyze, get_scenario_answer, get_available_topics]
 
 llm = ChatOpenAI(model="gpt-4o", temperature=0.1)
 llm_with_tools = llm.bind_tools(tools)
 
 
-# STRICT SYSTEM PROMPT - Emphasizes document-only responses
-SYSTEM_PROMPT = """You are a document-based support assistant. You can ONLY provide information that exists in the search results.
+# UPDATED SYSTEM PROMPT - SEARCH FIRST, NO SPECULATION
+SYSTEM_PROMPT = """You are a document-based support assistant. You ONLY provide information from search results.
 
-## ABSOLUTE RULES - YOU MUST FOLLOW THESE:
+## CRITICAL WORKFLOW:
 
-### RULE 1: SEARCH FIRST, ALWAYS
-- Call `search_documents` for EVERY user question
-- Wait for search results before responding
+### STEP 1: ALWAYS SEARCH FIRST
+For ANY user question, IMMEDIATELY call `search_and_analyze` tool.
+DO NOT ask clarifying questions BEFORE searching.
+DO NOT speculate about what scenarios might exist.
 
-### RULE 2: ONLY USE SEARCH RESULTS
-- You can ONLY use information from the `documents` array in search results
-- NEVER use your general knowledge
-- NEVER make up information
-- NEVER infer or guess beyond what's in the documents
+### STEP 2: INTERPRET SEARCH RESULTS
+After getting results from `search_and_analyze`:
 
-### RULE 3: CHECK `should_respond` FLAG
-- If search returns `"should_respond": false` → DO NOT answer the question
-- Instead, say you don't have information about this topic
-- Suggest the user ask about available topics
+**If `found_answer: false`:**
+- Respond: "I don't have information about that in my knowledge base."
+- Optionally suggest what topics you CAN help with
 
-### RULE 4: WHEN `should_respond` IS FALSE, SAY:
-"I don't have information about [topic] in my knowledge base. I can only answer questions about topics covered in the documentation. Would you like to ask about something else?"
-
-### RULE 5: NEVER DO THESE:
-- Never say "Based on my knowledge..."
-- Never say "Generally speaking..."
-- Never say "In most cases..."
-- Never provide information that's not in the search results
-- Never mention file names or sources
-
-### RULE 6: RESPONSE FORMAT
-When you DO have information:
-- Provide clear, direct answers
-- Use only content from the documents
+**If `found_answer: true` AND `disambiguation_needed: false`:**
+- Answer the question directly using the documents content
 - Be helpful and conversational
 
-When you DON'T have information:
-- Clearly state you don't have this information
-- Suggest the user try a different question
-- Offer to show available topics
+**If `found_answer: true` AND `disambiguation_needed: true`:**
+- Present the specific scenarios found (from the `scenarios` array)
+- Ask user to choose which applies to them
+- Wait for their response
 
-## TOOLS:
-- `search_documents`: Search for information (USE THIS FIRST)
-- `get_available_topics`: Show what topics are available"""
+### STEP 3: AFTER USER SELECTS SCENARIO
+- Call `get_scenario_answer` with their selection
+- Provide focused answer based on that scenario
+
+## ABSOLUTE RULES:
+
+1. **NEVER ask for clarification BEFORE searching**
+   - Wrong: "Which country's visa?" (before searching)
+   - Right: Search first, then answer or ask only if content has multiple scenarios
+
+2. **NEVER speculate about scenarios that might exist**
+   - Only present scenarios that are EXPLICITLY in the search results
+
+3. **If content is found, ANSWER IT**
+   - Don't ask "which type?" unless the content explicitly has multiple types
+
+4. **If content is NOT found, say so clearly**
+   - "I don't have information about [topic] in my knowledge base."
+
+5. **Be conversational and helpful**
+   - Answer like a knowledgeable human assistant would
+
+## RESPONSE STYLE:
+
+- Direct and helpful
+- Use the content from documents
+- Don't mention "documents" or "search results" - just provide the information naturally
+- If asking for clarification (only when disambiguation_needed: true), be friendly"""
 
 
 # ========================================
@@ -585,9 +764,8 @@ When you DON'T have information:
 
 
 def analyze_input(state: AgentState) -> dict:
-    """Analyze user input for intent and clarity."""
+    """Analyze user input - simplified to avoid premature clarification."""
     messages = state["messages"]
-    context = state.get("context", {})
 
     user_message = None
     for msg in reversed(messages):
@@ -596,49 +774,49 @@ def analyze_input(state: AgentState) -> dict:
             break
 
     if not user_message:
-        return {
-            "clarification_needed": False,
-            "interaction_mode": InteractionMode.QUERY.value,
-        }
+        return {"interaction_mode": InteractionMode.QUERY.value}
+
+    # Check if we're awaiting scenario selection
+    if state.get("awaiting_scenario_selection", False):
+        current_options = state.get("current_scenario_options", [])
+        selected = QueryAnalyzer.is_scenario_selection(user_message, current_options)
+
+        if selected:
+            return {
+                "interaction_mode": InteractionMode.DISAMBIGUATION.value,
+                "selected_scenario": selected,
+                "awaiting_scenario_selection": False,
+            }
+        else:
+            # User's response didn't match options - treat as new query
+            return {
+                "interaction_mode": InteractionMode.QUERY.value,
+                "awaiting_scenario_selection": False,
+                "selected_scenario": user_message,  # Use their response as context
+            }
 
     # Check for greetings
     if QueryAnalyzer.is_greeting(user_message):
-        return {
-            "interaction_mode": InteractionMode.GREETING.value,
-            "clarification_needed": False,
-        }
+        return {"interaction_mode": InteractionMode.GREETING.value}
 
     # Check for closings
     if QueryAnalyzer.is_closing(user_message):
+        return {"interaction_mode": InteractionMode.CLOSING.value}
+
+    # Check for too short
+    if QueryAnalyzer.is_too_short(user_message):
         return {
-            "interaction_mode": InteractionMode.CLOSING.value,
-            "clarification_needed": False,
+            "interaction_mode": InteractionMode.CLARIFICATION.value,
+            "clarification_needed": True,
+            "follow_up_questions": [
+                "Could you please tell me more about what you're looking for?"
+            ],
         }
 
-    # Handle pending clarification
-    if state.get("pending_clarification", False):
-        return {
-            "clarification_needed": False,
-            "pending_clarification": False,
-            "interaction_mode": InteractionMode.QUERY.value,
-        }
-
-    # Analyze query clarity
-    analysis = QueryAnalyzer.analyze(user_message, context)
-    needs_clarification = not analysis["is_clear"] and analysis["confidence"] < 0.3
-
+    # Default: proceed to search
     return {
-        "clarification_needed": needs_clarification,
-        "clarification_reason": analysis.get("clarification_type", ""),
-        "follow_up_questions": analysis.get("follow_up_questions", []),
-        "pending_clarification": needs_clarification,
-        "original_query": user_message if needs_clarification else "",
-        "search_confidence": analysis["confidence"],
-        "interaction_mode": (
-            InteractionMode.CLARIFICATION.value
-            if needs_clarification
-            else InteractionMode.QUERY.value
-        ),
+        "interaction_mode": InteractionMode.QUERY.value,
+        "original_query": user_message,
     }
 
 
@@ -647,13 +825,11 @@ def handle_greeting(state: AgentState) -> dict:
     import random
 
     greetings = [
-        "Hello! I'm your support assistant. I can answer questions based on the available documentation. How can I help you today?",
-        "Hi there! I'm here to help you find information from our knowledge base. What would you like to know?",
-        "Hey! I can help you with questions about topics in our documentation. What are you looking for?",
+        "Hello! I'm here to help you find information. What would you like to know?",
+        "Hi there! How can I assist you today?",
+        "Hey! I can answer questions based on available documentation. What do you need?",
     ]
-    return {
-        "messages": [AIMessage(content=random.choice(greetings))],
-    }
+    return {"messages": [AIMessage(content=random.choice(greetings))]}
 
 
 def handle_closing(state: AgentState) -> dict:
@@ -661,51 +837,36 @@ def handle_closing(state: AgentState) -> dict:
     import random
 
     closings = [
-        "You're welcome! Feel free to come back if you have more questions. Have a great day! 👋",
-        "Happy to help! Don't hesitate to ask if anything else comes up. Take care!",
-        "Glad I could assist! I'm here whenever you need help. Goodbye!",
+        "Goodbye! Feel free to come back if you have more questions.",
+        "Happy to help! Take care!",
+        "Glad I could assist! Have a great day!",
     ]
-    return {
-        "messages": [AIMessage(content=random.choice(closings))],
-    }
+    return {"messages": [AIMessage(content=random.choice(closings))]}
 
 
 def ask_clarification(state: AgentState) -> dict:
-    """Ask for clarification when needed."""
-    follow_up_questions = state.get("follow_up_questions", [])
-    attempts = state.get("clarification_attempts", 0)
-
-    if attempts >= 2:
-        return {
-            "messages": [AIMessage(content="Let me search with what I have...")],
-            "clarification_needed": False,
-            "pending_clarification": False,
-        }
-
-    message = (
-        follow_up_questions[0]
-        if follow_up_questions
-        else "Could you provide more details?"
-    )
-
+    """Ask for clarification for very short/unclear queries."""
+    follow_up = state.get("follow_up_questions", ["What would you like to know?"])
     return {
-        "messages": [AIMessage(content=message)],
+        "messages": [AIMessage(content=follow_up[0])],
         "pending_clarification": True,
-        "clarification_attempts": attempts + 1,
     }
 
 
 def agent(state: AgentState) -> dict:
-    """Main agent node - processes queries with strict document-only responses."""
+    """Main agent - processes queries by searching first."""
     messages = state["messages"]
-    topic_history = state.get("topic_history", [])
 
     context_info = ""
-    if topic_history:
-        context_info = f"\n\nRecent topics: {', '.join(topic_history[-3:])}"
 
-    if state.get("original_query"):
-        context_info += f"\nOriginal question: {state['original_query']}"
+    # Add context for scenario selection flow
+    if (
+        state.get("selected_scenario")
+        and state.get("interaction_mode") == InteractionMode.DISAMBIGUATION.value
+    ):
+        context_info = f"\n\nUser selected scenario: {state['selected_scenario']}"
+        context_info += f"\nOriginal query: {state.get('original_query', '')}"
+        context_info += "\nCall `get_scenario_answer` with this information."
 
     system = SystemMessage(content=SYSTEM_PROMPT + context_info)
     response = llm_with_tools.invoke([system] + list(messages))
@@ -713,77 +874,100 @@ def agent(state: AgentState) -> dict:
     return {"messages": [response], "has_searched": True}
 
 
-def validate_search_results(state: AgentState) -> dict:
-    """
-    CRITICAL NODE: Validate search results and determine if we should respond.
-    This prevents the LLM from using general knowledge.
-    """
+def validate_and_route(state: AgentState) -> dict:
+    """Validate search results and determine routing."""
     messages = state["messages"]
 
-    # Find the last tool message (search results)
+    # Find the last tool message
     last_tool_result = None
     for msg in reversed(messages):
         if isinstance(msg, ToolMessage):
             try:
                 last_tool_result = json.loads(msg.content)
                 break
-            except (json.JSONDecodeError, AttributeError):
+            except:
                 continue
 
     if last_tool_result is None:
         return {"should_respond_not_found": False}
 
-    # Check if search found relevant information
-    should_respond = last_tool_result.get("should_respond", False)
-    quality = last_tool_result.get("quality", SearchQuality.NOT_FOUND.value)
-    confidence = last_tool_result.get("confidence", 0)
     found_answer = last_tool_result.get("found_answer", False)
+    disambiguation_needed = last_tool_result.get("disambiguation_needed", False)
 
-    if not should_respond or quality == SearchQuality.NOT_FOUND.value:
-        # Generate not-found response
-        not_found_msg = NotFoundResponseGenerator.generate(
-            query=state.get("original_query", ""),
-            search_analysis=last_tool_result,
-            available_topics=None,  # Could fetch from get_available_topics
+    if not found_answer:
+        # No relevant information found
+        message = last_tool_result.get(
+            "message", "I don't have information about that."
         )
-
         return {
             "should_respond_not_found": True,
-            "not_found_message": not_found_msg,
-            "search_quality": quality,
-            "search_confidence": confidence,
+            "not_found_message": message,
             "found_relevant_info": False,
         }
 
+    if disambiguation_needed:
+        # Multiple scenarios found in content
+        scenarios = last_tool_result.get("scenarios", [])
+        options = [s.get("title", f"Option {i+1}") for i, s in enumerate(scenarios)]
+        question = last_tool_result.get("disambiguation_question", "")
+
+        if not question and scenarios:
+            question = "I found information about multiple scenarios:\n\n"
+            for i, s in enumerate(scenarios, 1):
+                question += f"{i}. **{s.get('title', f'Option {i}')}**\n"
+                if s.get("description"):
+                    question += f"   {s.get('description')}\n"
+            question += "\nWhich one applies to your situation?"
+
+        return {
+            "has_multiple_scenarios": True,
+            "detected_scenarios": scenarios,
+            "disambiguation_question": question,
+            "awaiting_scenario_selection": True,
+            "current_scenario_options": options,
+            "should_respond_not_found": False,
+            "search_results": json.dumps(last_tool_result),
+        }
+
+    # Single scenario or clear answer - proceed normally
     return {
         "should_respond_not_found": False,
-        "search_quality": quality,
-        "search_confidence": confidence,
         "found_relevant_info": True,
+        "search_results": json.dumps(last_tool_result),
     }
 
 
 def handle_not_found(state: AgentState) -> dict:
     """Handle case when no relevant information was found."""
-    not_found_message = state.get("not_found_message")
+    message = state.get(
+        "not_found_message",
+        "I don't have information about that in my knowledge base. "
+        "Is there something else I can help you with?",
+    )
+    return {"messages": [AIMessage(content=message)]}
 
-    # If no custom message, use a safe default
-    if not not_found_message:
-        not_found_message = (
-            "I don't have information about that topic in my knowledge base. "
-            "I can only answer questions about topics covered in the documentation. "
-            "Would you like to ask about something else?"
-        )
 
-    # NOT_FOUND messages should NOT be sanitized - they're pre-written
+def present_scenarios(state: AgentState) -> dict:
+    """Present scenario options when disambiguation is needed."""
+    question = state.get(
+        "disambiguation_question",
+        "I found multiple related scenarios. Could you specify which one you're asking about?",
+    )
     return {
-        "messages": [AIMessage(content=not_found_message)],
+        "messages": [AIMessage(content=question)],
+        "awaiting_scenario_selection": True,
     }
+
+
+# ========================================
+# ROUTING FUNCTIONS
+# ========================================
 
 
 def should_continue(state: AgentState) -> Literal["tools", "end"]:
     """Determine if we should continue to tools or end."""
     last_message = state["messages"][-1]
+
     if hasattr(last_message, "tool_calls") and last_message.tool_calls:
         return "tools"
     return "end"
@@ -797,22 +981,24 @@ def route_after_analysis(
 
     if mode == InteractionMode.GREETING.value:
         return "handle_greeting"
-
     if mode == InteractionMode.CLOSING.value:
         return "handle_closing"
-
-    if state.get("clarification_needed", False):
-        attempts = state.get("clarification_attempts", 0)
-        if attempts < 2:
-            return "ask_clarification"
+    if mode == InteractionMode.CLARIFICATION.value:
+        return "ask_clarification"
 
     return "agent"
 
 
-def route_after_validation(state: AgentState) -> Literal["handle_not_found", "agent"]:
+def route_after_validation(
+    state: AgentState,
+) -> Literal["handle_not_found", "agent", "present_scenarios"]:
     """Route based on search result validation."""
     if state.get("should_respond_not_found", False):
         return "handle_not_found"
+    if state.get("has_multiple_scenarios", False) and state.get(
+        "awaiting_scenario_selection", False
+    ):
+        return "present_scenarios"
     return "agent"
 
 
@@ -822,63 +1008,25 @@ def route_after_validation(state: AgentState) -> Literal["handle_not_found", "ag
 
 
 class ResponseSanitizer:
-    """Sanitize responses to remove file references without breaking normal text."""
+    """Sanitize responses to remove file references and general knowledge markers."""
 
-    # Patterns that indicate general knowledge usage
-    GENERAL_KNOWLEDGE_PATTERNS = [
-        r"(?i)\bbased on my (general )?knowledge\b",
-        r"(?i)\bgenerally speaking\b",
-        r"(?i)\bin most cases\b",
-        r"(?i)\bfrom what I know\b",
-        r"(?i)\bI believe that\b",
-        r"(?i)\bit'?s? commonly known\b",
-    ]
-
-    # File reference patterns - MORE SPECIFIC to avoid false positives
     FILE_PATTERNS = [
-        # Match actual file names with extensions
         r"\b[\w\-]+\.(pdf|docx?|txt|xlsx?|pptx?|csv|json|xml|html?|md)\b",
-        # Match "from/in [filename.ext]" - MUST have file extension
-        r'(?:from|in|according to)\s+["\']?[\w\-]+\.(pdf|docx?|txt|xlsx?|pptx?)["\']?',
-        # Match explicit source references
         r"\(source:\s*[^)]+\)",
-        r"\[source:\s*[^\]]+\]",
-        r"source:\s*[\w\-\.]+\.(pdf|docx?|txt)",
-        r"file:\s*[\w\-\.]+\.(pdf|docx?|txt)",
-        # Match "According to [Document Name]:" pattern
-        r"(?i)according to the [\w\s]+ document[,:]?\s*",
-        # Match "Based on [filename]" with extension
-        r"(?i)based on [\w\-]+\.(pdf|docx?|txt)[,:]?\s*",
-        # Match "From the [X] file:" pattern
-        r"(?i)from the [\w\s]+ file[,:]?\s*",
+        r"source:\s*[\w\-\.]+",
+        r"(?i)according to the [\w\s]+ document",
     ]
-
-    @classmethod
-    def contains_general_knowledge(cls, response: str) -> bool:
-        """Check if response seems to use general knowledge."""
-        for pattern in cls.GENERAL_KNOWLEDGE_PATTERNS:
-            if re.search(pattern, response):
-                return True
-        return False
 
     @classmethod
     def sanitize(cls, response: str) -> str:
-        """Remove file references without breaking normal text."""
         if not response:
             return response
-
         sanitized = response
-
-        # Apply each pattern carefully
         for pattern in cls.FILE_PATTERNS:
             sanitized = re.sub(pattern, "", sanitized, flags=re.IGNORECASE)
-
-        # Clean up any double spaces or leading/trailing spaces
         sanitized = re.sub(r"\s{2,}", " ", sanitized)
         sanitized = re.sub(r"\s+([.,!?])", r"\1", sanitized)
-        sanitized = sanitized.strip()
-
-        return sanitized
+        return sanitized.strip()
 
 
 # ========================================
@@ -896,8 +1044,9 @@ def create_agent():
     workflow.add_node("ask_clarification", ask_clarification)
     workflow.add_node("agent", agent)
     workflow.add_node("tools", ToolNode(tools))
-    workflow.add_node("validate_search", validate_search_results)
+    workflow.add_node("validate_and_route", validate_and_route)
     workflow.add_node("handle_not_found", handle_not_found)
+    workflow.add_node("present_scenarios", present_scenarios)
 
     # Entry point
     workflow.add_edge(START, "analyze_input")
@@ -919,20 +1068,27 @@ def create_agent():
     workflow.add_edge("handle_closing", END)
     workflow.add_edge("ask_clarification", END)
     workflow.add_edge("handle_not_found", END)
+    workflow.add_edge("present_scenarios", END)
 
-    # Agent -> Tools or End
+    # Agent -> tools or end
     workflow.add_conditional_edges(
-        "agent", should_continue, {"tools": "tools", "end": END}
+        "agent",
+        should_continue,
+        {"tools": "tools", "end": END},
     )
 
-    # Tools -> Validate Search Results
-    workflow.add_edge("tools", "validate_search")
+    # Tools -> Validate
+    workflow.add_edge("tools", "validate_and_route")
 
-    # Validate -> Handle Not Found or Continue to Agent
+    # Validate -> route appropriately
     workflow.add_conditional_edges(
-        "validate_search",
+        "validate_and_route",
         route_after_validation,
-        {"handle_not_found": "handle_not_found", "agent": "agent"},
+        {
+            "handle_not_found": "handle_not_found",
+            "present_scenarios": "present_scenarios",
+            "agent": "agent",
+        },
     )
 
     memory = MemorySaver()
@@ -944,52 +1100,25 @@ def create_agent():
 # ========================================
 
 
-class StrictDocumentChatbot:
-    """Chatbot that ONLY responds from document content."""
+class SmartChatbot:
+    """Chatbot that searches first, then disambiguates only when necessary."""
 
     def __init__(self):
         self.agent = create_agent()
         self.thread_id = f"session_{datetime.now().timestamp()}"
-        self.context = {
-            "last_topic": None,
-            "topics_discussed": [],
-            "questions_asked": 0,
-            "session_start": datetime.now().isoformat(),
-        }
+        self.context = {}
         self.topic_history = []
         self.conversation_history = []
-        self.pending_clarification = False
+
+        # Scenario tracking
+        self.awaiting_scenario_selection = False
+        self.current_scenario_options = []
         self.original_query = None
-        self.clarification_attempts = 0
-
-    def _extract_topics(self, message: str) -> List[str]:
-        """Extract topics from message."""
-        topic_keywords = {
-            "authentication": ["login", "password", "auth", "sign in"],
-            "user_management": ["user", "account", "profile", "permission"],
-            "configuration": ["setting", "config", "setup"],
-            "billing": ["invoice", "payment", "billing"],
-            "booking": ["booking", "reservation", "travel"],
-        }
-
-        message_lower = message.lower()
-        detected = []
-
-        for topic, keywords in topic_keywords.items():
-            if any(kw in message_lower for kw in keywords):
-                detected.append(topic)
-
-        return detected
+        self.search_results = None
 
     def chat(self, message: str) -> str:
         """Process a chat message."""
         config = {"configurable": {"thread_id": self.thread_id}}
-
-        self.context["questions_asked"] += 1
-        topics = self._extract_topics(message)
-        if topics:
-            self.context["last_topic"] = topics[0]
-            self.topic_history.extend(topics)
 
         initial_state = {
             "messages": [HumanMessage(content=message)],
@@ -997,11 +1126,11 @@ class StrictDocumentChatbot:
             "clarification_needed": False,
             "clarification_reason": "",
             "follow_up_questions": [],
-            "pending_clarification": self.pending_clarification,
+            "pending_clarification": False,
             "original_query": self.original_query or message,
-            "clarification_attempts": self.clarification_attempts,
+            "clarification_attempts": 0,
             "user_intent": "",
-            "detected_topics": topics,
+            "detected_topics": [],
             "sentiment": "neutral",
             "interaction_mode": InteractionMode.QUERY.value,
             "conversation_history": self.conversation_history,
@@ -1009,46 +1138,44 @@ class StrictDocumentChatbot:
             "search_confidence": 0.0,
             "search_quality": "",
             "has_searched": False,
-            "search_results": "",
+            "search_results": self.search_results or "",
             "found_relevant_info": False,
             "best_match_score": float("inf"),
             "should_respond_not_found": False,
             "not_found_message": "",
+            "has_multiple_scenarios": False,
+            "detected_scenarios": [],
+            "scenario_status": ScenarioStatus.SINGLE.value,
+            "disambiguation_question": "",
+            "selected_scenario": None,
+            "disambiguation_depth": 0,
+            "scenario_context": [],
+            "awaiting_scenario_selection": self.awaiting_scenario_selection,
+            "filtered_search_results": "",
+            "current_scenario_options": self.current_scenario_options,
         }
 
         try:
             result = self.agent.invoke(initial_state, config=config)
 
-            self.pending_clarification = result.get("pending_clarification", False)
-            if self.pending_clarification:
+            # Update tracking state
+            self.awaiting_scenario_selection = result.get(
+                "awaiting_scenario_selection", False
+            )
+            self.current_scenario_options = result.get("current_scenario_options", [])
+
+            if self.awaiting_scenario_selection:
                 self.original_query = result.get("original_query", message)
-                self.clarification_attempts = result.get("clarification_attempts", 0)
+                self.search_results = result.get("search_results", "")
             else:
                 self.original_query = None
-                self.clarification_attempts = 0
+                self.search_results = None
 
             # Get response
             for msg in reversed(result["messages"]):
                 if isinstance(msg, AIMessage) and msg.content:
-                    response = msg.content
+                    response = ResponseSanitizer.sanitize(msg.content)
 
-                    # Only sanitize if it's NOT a pre-written not-found response
-                    is_not_found_response = result.get(
-                        "should_respond_not_found", False
-                    )
-
-                    if not is_not_found_response:
-                        # Check for general knowledge usage
-                        if ResponseSanitizer.contains_general_knowledge(response):
-                            response = (
-                                "I don't have specific information about that in my knowledge base. "
-                                "Could you try asking about a different topic?"
-                            )
-                        else:
-                            # Only sanitize LLM-generated responses for file references
-                            response = ResponseSanitizer.sanitize(response)
-
-                    # Track conversation
                     self.conversation_history.append(
                         {"role": "user", "content": message}
                     )
@@ -1059,40 +1186,44 @@ class StrictDocumentChatbot:
                     return response
 
         except Exception as e:
-            print(f"Error in chat: {e}")
+            print(f"Error: {e}")
             import traceback
 
             traceback.print_exc()
-            return "I encountered an issue processing your request. Could you please try again?"
+            return "I encountered an issue. Please try again."
 
         return "I couldn't generate a response. Please try again."
 
     def run(self):
         """Run interactive chat."""
         print("\n" + "=" * 60)
-        print("  📚 DOCUMENT-BASED SUPPORT ASSISTANT")
+        print("  🤖 SMART SUPPORT ASSISTANT")
         print("=" * 60)
-        print("\nI can ONLY answer questions from the indexed documents.")
-        print("Type 'quit' to exit, 'topics' to see available topics.\n")
+        print("\nAsk me anything! I'll search my knowledge base first.")
+        print("Type 'quit' to exit, 'topics' for available topics.\n")
 
         if VECTOR_STORE is not None:
             docs = VECTOR_STORE.similarity_search("", k=10000)
             files = set(doc.metadata.get("filename", "Unknown") for doc in docs)
             print(f"📁 {len(files)} document(s) loaded.\n")
         else:
-            print("⚠️ No documents indexed. I won't be able to answer questions.\n")
+            print("⚠️ No documents indexed.\n")
 
         print("-" * 60)
 
         while True:
             try:
-                user_input = input("\n👤 You: ").strip()
+                prompt = "\n👤 You: "
+                if self.awaiting_scenario_selection:
+                    prompt = "\n👤 You (select an option): "
+
+                user_input = input(prompt).strip()
 
                 if not user_input:
                     continue
 
                 if user_input.lower() in ["quit", "exit", "q"]:
-                    print("\n👋 Goodbye! Have a great day!\n")
+                    print("\n👋 Goodbye!\n")
                     break
 
                 if user_input.lower() == "topics":
@@ -1105,9 +1236,7 @@ class StrictDocumentChatbot:
                             for topic in topics:
                                 print(f"   • {topic}")
                         else:
-                            print(
-                                "\n📋 No specific topics detected in the knowledge base."
-                            )
+                            print("\n📋 No specific topics detected.")
                     except:
                         print("\n📋 Could not retrieve topics.")
                     continue
@@ -1127,5 +1256,5 @@ class StrictDocumentChatbot:
 # ========================================
 
 if __name__ == "__main__":
-    chatbot = StrictDocumentChatbot()
+    chatbot = SmartChatbot()
     chatbot.run()
