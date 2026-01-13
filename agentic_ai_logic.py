@@ -588,6 +588,76 @@ CRITICAL:
             }
 
 
+def is_visa_country_scenario(scenarios: List[dict]) -> bool:
+    """
+    Heuristic: treat as a visa/country disambiguation if multiple scenarios
+    mention 'visa' in the title.
+    """
+    if not scenarios:
+        return False
+
+    titles = [s.get("title", "").lower() for s in scenarios]
+    visa_titles = [t for t in titles if "visa" in t]
+    return len(visa_titles) >= 2
+
+
+def build_dynamic_visa_disambiguation_question(
+    state: AgentState, scenarios: List[dict]
+) -> str:
+    """
+    Build ONE clarification question for visa scenarios, using the recent
+    conversation + scenario titles.
+
+    It should:
+    - Use the conversation to infer what the user ALREADY specified
+      (country and/or visa type).
+    - Ask ONLY for what is still missing.
+    - NOT list internal options or country names.
+    - Return 'NO_QUESTION' if nothing else is needed.
+    """
+
+    # Get recent conversation turns
+    messages = state.get("messages", [])
+    conv_lines = []
+    # Take last few turns to keep prompt small
+    for m in messages[-8:]:
+        if isinstance(m, HumanMessage):
+            conv_lines.append(f"User: {m.content}")
+        elif isinstance(m, AIMessage):
+            conv_lines.append(f"Assistant: {m.content}")
+    conversation = "\n".join(conv_lines)
+
+    scenario_titles = [s.get("title", "") for s in scenarios]
+
+    system_msg = SystemMessage(
+        content=(
+            "You write ONE short clarifying question for a visa support assistant.\n\n"
+            "You will be given the recent conversation and internal visa scenario titles.\n\n"
+            "Rules:\n"
+            "1. Use the conversation to infer what the user has ALREADY specified "
+            "(e.g., visa type such as student/work, and/or country).\n"
+            "2. Ask ONLY for the information that is still missing to uniquely determine "
+            "the visa scenario (usually country and/or visa type).\n"
+            "3. Do NOT list or mention any specific scenario titles or country names from the list.\n"
+            "4. Do NOT repeat information the user already gave.\n"
+            "5. If the conversation already identifies a single clear visa scenario and "
+            "no clarification is needed, respond with exactly: NO_QUESTION\n"
+            "6. Otherwise, respond with exactly ONE clarifying question sentence, and nothing else."
+        )
+    )
+
+    human_msg = HumanMessage(
+        content=(
+            f"Recent conversation:\n{conversation}\n\n"
+            f"Internal scenario titles:\n{scenario_titles}\n\n"
+            "Decide whether clarification is needed, and if so, ask one question."
+        )
+    )
+
+    resp = llm.invoke([system_msg, human_msg])
+    return resp.content.strip()
+
+
 # ========================================
 # TOOLS
 # ========================================
@@ -1109,6 +1179,32 @@ def validate_and_route(state: AgentState) -> dict:
         options = [s.get("title", f"Option {i+1}") for i, s in enumerate(scenarios)]
         question = last_tool_result.get("disambiguation_question", "")
 
+        # ----- DYNAMIC VISA QUESTION LOGIC -----
+        if is_visa_country_scenario(scenarios):
+            try:
+                dyn_q = build_dynamic_visa_disambiguation_question(state, scenarios)
+                if dyn_q == "NO_QUESTION":
+                    # Conversation already pins down a single visa scenario.
+                    # Treat this as if no disambiguation is required.
+                    return {
+                        "should_respond_not_found": False,
+                        "found_relevant_info": True,
+                        "search_results": json.dumps(last_tool_result),
+                        "requires_choice": False,
+                        "awaiting_scenario_selection": False,
+                        # Will still go through agent to generate the answer
+                        "answer_provided": True,
+                    }
+                else:
+                    # Use the dynamic question; for visa we *don't* want to list options.
+                    question = dyn_q
+                    options = []
+            except Exception:
+                # If anything goes wrong, fall back to normal behaviour below
+                pass
+        # ----- END DYNAMIC VISA LOGIC -----
+
+        # Fallback: if still no question, build the standard options list
         if not question and scenarios:
             question = "I found information about multiple options:\n\n"
             for i, s in enumerate(scenarios, 1):
@@ -1129,16 +1225,6 @@ def validate_and_route(state: AgentState) -> dict:
             "search_results": json.dumps(last_tool_result),
             "answer_provided": False,
         }
-
-    # Single scenario or clear answer - proceed normally
-    return {
-        "should_respond_not_found": False,
-        "found_relevant_info": True,
-        "search_results": json.dumps(last_tool_result),
-        "requires_choice": False,
-        "awaiting_scenario_selection": False,
-        "answer_provided": True,  # Will be set after agent responds
-    }
 
 
 def handle_not_found(state: AgentState) -> dict:
