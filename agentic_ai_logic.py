@@ -462,6 +462,23 @@ class QueryAnalyzer:
 # ========================================
 # SCENARIO DETECTOR (STRICT)
 # ========================================
+
+
+def is_visa_country_scenario(scenarios: List[dict]) -> bool:
+    """
+    Heuristic: treat as a visa/country disambiguation if multiple scenarios
+    mention 'visa' in the title.
+    """
+    if not scenarios:
+        return False
+
+    titles = [s.get("title", "").lower() for s in scenarios]
+    visa_titles = [t for t in titles if "visa" in t]
+
+    # At least two visa-related scenarios → treat as visa/country disambiguation
+    return len(visa_titles) >= 2
+
+
 class ScenarioDetector:
     """
     Detects multiple scenarios ONLY from actual content in search results.
@@ -667,12 +684,29 @@ def search_and_analyze(query: str) -> str:
             }
         )
 
+        # Check for multiple scenarios in the ACTUAL content
+
     # Check for multiple scenarios in the ACTUAL content
     scenario_result = ScenarioDetector.detect(query, documents, llm)
 
+    scenarios = scenario_result.get("scenarios", [])
     has_multiple = scenario_result.get("has_multiple_scenarios", False)
     requires_choice = scenario_result.get("requires_choice", False)
     disambiguation_needed = requires_choice
+
+    # Default: use whatever the detector produced
+    disambiguation_question = ""
+    if disambiguation_needed:
+        disambiguation_question = scenario_result.get("disambiguation_question", "")
+
+        # --- VISA / COUNTRY SPECIAL HANDLING ---
+        # For visa-related scenarios, ask a generic question instead of listing
+        # "UK Student Visa, USA Student Visa, ..." etc.
+        if "visa" in query.lower() or is_visa_country_scenario(scenarios):
+            disambiguation_question = (
+                "Please specify the country and visa type you are asking about."
+            )
+        # ---------------------------------------
 
     return json.dumps(
         {
@@ -682,16 +716,11 @@ def search_and_analyze(query: str) -> str:
             "confidence": float(analysis["confidence"]),
             "documents": documents,
             "count": len(documents),
-            # Scenario info
             "has_multiple_scenarios": has_multiple,
             "requires_choice": requires_choice,
             "disambiguation_needed": disambiguation_needed,
-            "scenarios": scenario_result.get("scenarios", []),
-            "disambiguation_question": (
-                scenario_result.get("disambiguation_question", "")
-                if disambiguation_needed
-                else ""
-            ),
+            "scenarios": scenarios,
+            "disambiguation_question": disambiguation_question,
         }
     )
 
